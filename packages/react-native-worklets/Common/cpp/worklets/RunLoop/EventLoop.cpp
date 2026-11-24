@@ -55,15 +55,15 @@ void EventLoop::run() {
       }
 
       const auto currentTime = getCurrentTimeInMs();
-      std::vector<std::function<void(jsi::Runtime & rt)>> jobs;
+      std::vector<Timeout> dueTimeouts;
       auto &timeouts = state->queue;
       timeouts.erase(
           std::remove_if(
               timeouts.begin(),
               timeouts.end(),
-              [currentTime, &jobs](const Timeout &timeout) {
+              [currentTime, &dueTimeouts](const Timeout &timeout) {
                 if (currentTime >= timeout.targetTime) {
-                  jobs.emplace_back(timeout.callback);
+                  dueTimeouts.push_back(timeout);
                   return true;
                 }
                 return false;
@@ -71,8 +71,8 @@ void EventLoop::run() {
           timeouts.end());
       lock.unlock();
 
-      if (auto strongThis = weakThis.lock(); strongThis && !jobs.empty()) {
-        strongThis->deferToNextFrame(std::move(jobs));
+      if (auto strongThis = weakThis.lock(); strongThis && !dueTimeouts.empty()) {
+        strongThis->releaseDueTimeouts(std::move(dueTimeouts));
       }
     }
   });
@@ -132,6 +132,25 @@ void EventLoop::setFrameSource(FrameRequester &&requestFrame, bool deliversOnRun
   std::lock_guard<std::mutex> lock(frameTimeoutsMutex_);
   requestFrame_ = std::move(requestFrame);
   deliversOnRuntimeThread_ = deliversOnRuntimeThread;
+}
+
+void EventLoop::releaseDueTimeouts(std::vector<Timeout> &&dueTimeouts) {
+  bool alignsToFrames;
+  {
+    std::lock_guard<std::mutex> lock(frameTimeoutsMutex_);
+    alignsToFrames = static_cast<bool>(requestFrame_);
+  }
+  std::vector<std::function<void(jsi::Runtime & rt)>> frameAlignedJobs;
+  for (auto &timeout : dueTimeouts) {
+    if (alignsToFrames && !timeout.immediate) {
+      frameAlignedJobs.push_back(std::move(timeout.callback));
+    } else {
+      pushTask(std::move(timeout.callback));
+    }
+  }
+  if (!frameAlignedJobs.empty()) {
+    deferToNextFrame(std::move(frameAlignedJobs));
+  }
 }
 
 void EventLoop::deferToNextFrame(std::vector<std::function<void(jsi::Runtime &rt)>> &&jobs) {
@@ -198,6 +217,20 @@ void EventLoop::pushTimeout(std::function<void(jsi::Runtime &rt)> &&job, int64_t
     }
     const auto targetTime = getCurrentTimeInMs() + delay;
     const auto timeout = Timeout{std::move(job), targetTime};
+    auto &queue = timeoutsQueueState_->queue;
+    auto it = std::upper_bound(queue.begin(), queue.end(), timeout);
+    queue.insert(it, timeout);
+  }
+  timeoutsQueueState_->cv.notify_one();
+}
+
+void EventLoop::pushImmediate(std::function<void(jsi::Runtime &rt)> &&job) {
+  {
+    std::unique_lock<std::mutex> lock(timeoutsQueueState_->mutex);
+    if (!timeoutsQueueState_->running) {
+      return;
+    }
+    const auto timeout = Timeout{std::move(job), getCurrentTimeInMs(), true};
     auto &queue = timeoutsQueueState_->queue;
     auto it = std::upper_bound(queue.begin(), queue.end(), timeout);
     queue.insert(it, timeout);

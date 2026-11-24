@@ -269,6 +269,21 @@ void WorkletRuntimeDecorator::decorate(
         return jsi::Value::undefined();
       });
 
+  jsi_utils::installJsiFunction(
+      rt,
+      "__scheduleImmediateCallback",
+      [weakEventLoop = std::weak_ptr<EventLoop>(eventLoop)](
+          jsi::Runtime &, const jsi::Value &handlerIdJs) -> jsi::Value {
+        const auto handlerId = handlerIdJs.asNumber();
+        const auto job = [handlerId](jsi::Runtime &rt) {
+          rt.global().getPropertyAsFunction(rt, "__runTimeoutCallback").call(rt, handlerId);
+        };
+        if (auto strongEventLoop = weakEventLoop.lock()) {
+          strongEventLoop->pushImmediate(job);
+        }
+        return jsi::Value::undefined();
+      });
+
   if (!enableVSync || !eventLoop) {
     return;
   }
